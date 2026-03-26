@@ -1,22 +1,49 @@
 import io
 from typing import List, Dict, Any
+
+# 尝试导入更强大的 PyMuPDF (fitz)
+try:
+    import fitz
+    PYMUPDF_AVAILABLE = True
+except ImportError:
+    PYMUPDF_AVAILABLE = False
+
+# 保留 pypdf 作为备选
 from pypdf import PdfReader
 
 
 def parse_pdf(data: bytes) -> List[Dict[str, Any]]:
     """
-    Returns units per page:
-      [{"text": "...", "meta": {"page": 1}}, ...]
-    Notes:
-    - If PDF is scanned/image-only, extract_text may return None/empty.
+    解析 PDF：优先使用 PyMuPDF 处理学术论文的双栏布局，
+    如果未安装则降级使用 pypdf。
     """
-    reader = PdfReader(io.BytesIO(data))
-    units: List[Dict[str, Any]] = []
-    for i, page in enumerate(reader.pages):
-        text = page.extract_text() or ""
-        text = text.strip()
-        if text:
-            units.append({"text": text, "meta": {"page": i + 1}})
+    units = []
+
+    if PYMUPDF_AVAILABLE:
+        # --- 方案 A: 使用 PyMuPDF (更适合双栏论文) ---
+        with fitz.open(stream=data, filetype="pdf") as doc:
+            for i, page in enumerate(doc):
+                # "text" 模式能够根据阅读流智能识别分栏顺序
+                text = page.get_text("text").strip()
+                if text:
+                    # 将多个空格和换行符统一成一个空格，清理碎片化文本
+                    clean_text = " ".join(text.split())
+                    units.append({
+                        "text": clean_text,
+                        "meta": {"page": i + 1}
+                    })
+    else:
+        # --- 方案 B: 使用 pypdf (基础 fallback) ---
+        reader = PdfReader(io.BytesIO(data))
+        for i, page in enumerate(reader.pages):
+            text = page.extract_text() or ""
+            if text.strip():
+                clean_text = " ".join(text.split())
+                units.append({
+                    "text": clean_text,
+                    "meta": {"page": i + 1}
+                })
+
     return units
 
 
