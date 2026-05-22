@@ -1,0 +1,8 @@
+{
+  "n_scored": 4,
+  "top_k": 4,
+  "hit_at_k": 0.75,
+  "mrr": 0.625,
+  "avg_latency_s": 6.255969405174255,
+  "unanswerable_skipped": null
+}

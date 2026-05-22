@@ -1,0 +1,12 @@
+{
+  "n_scored": 4,
+  "n_answerable": 3,
+  "n_unanswerable": 1,
+  "has_citation_rate_answerable": 1.0,
+  "refused_rate_answerable": 0.0,
+  "refusal_accuracy_unanswerable": 1.0,
+  "hallucination_rate_unanswerable": 0.0,
+  "rate_limit_count": 0,
+  "avg_latency_s": 1.0541474223136902,
+  "server_error_count": 0
+}

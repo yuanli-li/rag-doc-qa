@@ -16,7 +16,36 @@ def fetch_documents():
     return r.json()["items"]
 
 
+if st.button("Refresh documents list"):
+    fetch_documents.clear()
+
 docs = fetch_documents()
+
+st.subheader("Ingest a new document")
+
+uploaded = st.file_uploader(
+    "Upload PDF/MD/TXT", type=["pdf", "md", "markdown", "txt"])
+new_title = st.text_input("Title (optional)", value="")
+replace = st.checkbox("Replace if same file uploaded", value=True)
+
+if st.button("Ingest"):
+    if not uploaded:
+        st.warning("Please choose a file first.")
+    else:
+        files = {"file": (uploaded.name, uploaded.getvalue(),
+                          uploaded.type or "application/octet-stream")}
+        data = {"title": new_title, "replace": str(replace).lower()}
+        r = requests.post(f"{API_BASE}/ingest",
+                          files=files, data=data, timeout=300)
+        if r.status_code != 200:
+            st.error(f"/ingest failed: HTTP {r.status_code}")
+            st.code(r.text[:4000])
+        else:
+            st.success("Ingested successfully!")
+            st.json(r.json())
+            # refresh list
+            fetch_documents.clear()
+            st.rerun()
 
 if not docs:
     st.warning("No documents found. Ingest a PDF/MD first.")

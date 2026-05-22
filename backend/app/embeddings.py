@@ -1,55 +1,100 @@
 import os
+import time
+import threading
+import hashlib
+from collections import OrderedDict
+
 import numpy as np
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+from openai import OpenAI
 
 load_dotenv()
+client = OpenAI()
 
-MODEL = "gemini-embedding-001"  # stable text embedding model
-OUTPUT_DIM = 768               # recommended size for storage/perf tradeoff
-EXPECTED_DIM = OUTPUT_DIM
+EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+EMBED_DIMS = int(os.getenv("OPENAI_EMBED_DIMS", "768"))
 
-_API_KEY = os.getenv("GEMINI_API_KEY")
-if not _API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is not set. Put it in backend/.env")
+CACHE_MAX = int(os.getenv("EMBED_CACHE_MAX", "2000"))
+CACHE_TTL = int(os.getenv("EMBED_CACHE_TTL_SECONDS", "3600"))
 
-_client = genai.Client(api_key=_API_KEY)
-
-
-def embed_texts(texts: list[str], task_type: str) -> list[np.ndarray]:
-    """
-    task_type:
-      - "RETRIEVAL_DOCUMENT" for chunks
-      - "RETRIEVAL_QUERY" for query
-    """
-    clean = [t.strip() for t in texts]
-    if any(len(t) == 0 for t in clean):
-        raise ValueError("Empty string is not allowed for embeddings input.")
-
-    resp = _client.models.embed_content(
-        model=MODEL,
-        contents=clean,
-        config=types.EmbedContentConfig(
-            task_type=task_type,
-            output_dimensionality=OUTPUT_DIM,
-        ),
-    )
-
-    vectors: list[np.ndarray] = []
-    for emb in resp.embeddings:
-        v = np.array(emb.values, dtype=np.float32)
-        if v.shape[0] != EXPECTED_DIM:
-            raise RuntimeError(
-                f"Embedding dim mismatch: got {v.shape[0]}, expected {EXPECTED_DIM}")
-        vectors.append(v)
-
-    return vectors
+# key -> (ts, np.ndarray)
+_cache: "OrderedDict[str, tuple[float, np.ndarray]]" = OrderedDict()
+_lock = threading.Lock()
 
 
-def embed_documents(texts: list[str]) -> list[np.ndarray]:
-    return embed_texts(texts, task_type="RETRIEVAL_DOCUMENT")
+def _key_for_text(text: str) -> str:
+    # normalize a little to reduce duplicates
+    t = " ".join((text or "").strip().split())
+    h = hashlib.sha256(t.encode("utf-8")).hexdigest()
+    return f"{EMBED_MODEL}|{EMBED_DIMS}|{h}"
+
+
+def _cache_get(key: str) -> np.ndarray | None:
+    now = time.time()
+    with _lock:
+        item = _cache.get(key)
+        if item is None:
+            return None
+        ts, vec = item
+        if now - ts > CACHE_TTL:
+            # expired
+            _cache.pop(key, None)
+            return None
+        # LRU refresh
+        _cache.move_to_end(key)
+        return vec
+
+
+def _cache_put(key: str, vec: np.ndarray) -> None:
+    now = time.time()
+    with _lock:
+        _cache[key] = (now, vec)
+        _cache.move_to_end(key)
+        # evict LRU
+        while len(_cache) > CACHE_MAX:
+            _cache.popitem(last=False)
+
+
+def embed_texts(texts: list[str]) -> list[np.ndarray]:
+    if not texts:
+        return []
+
+    # 1) cache lookup
+    keys = [_key_for_text(t) for t in texts]
+    out: list[np.ndarray | None] = [None] * len(texts)
+
+    missing_texts: list[str] = []
+    missing_pos: list[int] = []
+
+    for i, k in enumerate(keys):
+        v = _cache_get(k)
+        if v is not None:
+            out[i] = v
+        else:
+            missing_texts.append(texts[i])
+            missing_pos.append(i)
+
+    # 2) call OpenAI only for misses
+    if missing_texts:
+        resp = client.embeddings.create(
+            model=EMBED_MODEL,
+            input=missing_texts,
+            dimensions=EMBED_DIMS,
+            encoding_format="float",
+        )
+        new_vecs = [np.array(d.embedding, dtype=np.float32) for d in resp.data]
+
+        for pos, vec, text in zip(missing_pos, new_vecs, missing_texts):
+            out[pos] = vec
+            _cache_put(_key_for_text(text), vec)
+
+    # 3) type assert
+    return [v for v in out if v is not None]
 
 
 def embed_queries(texts: list[str]) -> list[np.ndarray]:
-    return embed_texts(texts, task_type="RETRIEVAL_QUERY")
+    return embed_texts(texts)
+
+
+def embed_documents(texts: list[str]) -> list[np.ndarray]:
+    return embed_texts(texts)
