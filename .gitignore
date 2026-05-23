@@ -3,3 +3,8 @@ backend/.env
 __pycache__/
 *.pyc
 .DS_Store
+# Evaluation run outputs
+eval/data/results/*.tsv
+
+# Local environment files
+.env
