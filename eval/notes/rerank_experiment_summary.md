@@ -29,3 +29,5 @@ However, adding lightweight query normalization made reranking more semantically
 ## Takeaway
 The current retrieval weakness appears to be a ranking problem for abstract purpose/objective-style paraphrase questions.
 A lightweight reranking layer with query normalization may be a practical next step before introducing a heavier learned reranker.
+
+

@@ -126,6 +126,17 @@ BOOST_TERMS: dict[str, float] = {
     "metadata": 0.12,
     "cite": 0.08,
     "citation": 0.08,
+    # numeric boundary / protocol duration
+    "duration": 0.18,
+    "minute": 0.16,
+    "minutes": 0.16,
+    "protocol": 0.14,
+    "exposed": 0.12,
+    "recover": 0.12,
+    "recovery": 0.10,
+    "phase": 0.08,
+    "peak": 0.10,
+    "value": 0.08,
 }
 
 
@@ -154,6 +165,55 @@ def tokenize(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", text.lower())
 
 
+def numeric_boundary_bonus(query: str, text: str) -> float:
+    q = normalize_query(query)
+    q_tokens = set(tokenize(q))
+    t_tokens = set(tokenize(text))
+
+    bonus = 0.0
+
+    asks_duration = (
+        "duration" in q_tokens
+        or ("how" in q_tokens and "long" in q_tokens)
+        or "minutes" in q_tokens
+        or "minute" in q_tokens
+    )
+
+    if asks_duration:
+        # Strongly reward chunks that actually contain timing/protocol evidence.
+        if "minutes" in t_tokens or "minute" in t_tokens:
+            bonus += 0.35
+        if "protocol" in t_tokens:
+            bonus += 0.20
+        if "exposed" in t_tokens:
+            bonus += 0.15
+        if "recover" in t_tokens or "recovery" in t_tokens:
+            bonus += 0.12
+
+        # Penalize pure conclusion/result chunks for duration questions.
+        if "conclusion" in t_tokens:
+            bonus -= 0.12
+        if "result" in t_tokens or "results" in t_tokens:
+            bonus -= 0.08
+
+    asks_numeric_value = (
+        "value" in q_tokens
+        or "peak" in q_tokens
+        or "mean" in q_tokens
+        or "units" in q_tokens
+    )
+
+    if asks_numeric_value:
+        if "value" in t_tokens or "mean" in t_tokens:
+            bonus += 0.18
+        if "units" in t_tokens:
+            bonus += 0.12
+        if "peak" in t_tokens:
+            bonus += 0.12
+
+    return bonus
+
+
 def lexical_bonus(query: str, text: str) -> float:
     q_norm = normalize_query(query)
     q_tokens = set(tokenize(q_norm))
@@ -170,6 +230,7 @@ def lexical_bonus(query: str, text: str) -> float:
         if tok in q_tokens and tok in t_tokens:
             bonus += weight
 
+    bonus += numeric_boundary_bonus(query, text)
     return bonus
 
 
@@ -193,3 +254,32 @@ def rerank_results(query: str, results: list[dict[str, Any]]) -> list[dict[str, 
 
     reranked.sort(key=lambda x: x["rerank_score"], reverse=True)
     return reranked
+
+
+def rerank_rows(query: str, rows: list[tuple]) -> list[tuple]:
+    """
+    Rerank raw DB rows by:
+      1) converting rows -> citation-style dicts
+      2) applying rerank_results(query, ...)
+      3) mapping back to the original rows
+
+    Important:
+      - this changes ORDER only
+      - it does NOT recompute cosine distances
+      - threshold logic should still use the original raw rows
+    """
+    if not rows:
+        return rows
+
+    retrieved = citations_from_rows(rows)
+    reranked = rerank_results(query, retrieved)
+
+    row_by_chunk_id = {row[0]: row for row in rows}  # row[0] = chunk_id
+    out: list[tuple] = []
+
+    for r in reranked:
+        cid = r.get("chunk_id")
+        if cid in row_by_chunk_id:
+            out.append(row_by_chunk_id[cid])
+
+    return out

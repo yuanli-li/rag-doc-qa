@@ -19,8 +19,12 @@ import time
 from hashlib import sha256
 import os
 from dotenv import load_dotenv
-from .retrieval import retrieve_top_k, citations_from_rows, rerank_results
-
+from .retrieval import (
+    retrieve_top_k,
+    citations_from_rows,
+    rerank_results,
+    rerank_rows,
+)
 
 load_dotenv()
 
@@ -181,65 +185,6 @@ def search_text(req: SearchTextRequest) -> Dict[str, Any]:
     return {"ok": True, "query_text": req.query_text, "top_k": req.top_k, "results": results}
 
 
-def retrieve_top_k(query_vec: np.ndarray, top_k: int, document_id: int | None = None):
-    """
-    Retrieves the nearest database chunks with parent document metadata.
-
-    This low-level core RAG utility interacts directly with PostgreSQL to fetch 
-    the most semantically relevant text fragments. It implements two operational modes:
-    1. Global Search (when `document_id` is None): Scans the entire vector database.
-    2. Targeted Search (when `document_id` is provided): Restricts the computation 
-       scope to chunks belonging to a specific document via an optimized `WHERE` clause.
-
-    Both modes utilize an inner `JOIN` operation on the `documents` table to 
-    dynamically pull the parent document's `title` and `filename`, serving as the 
-    foundational ledger data for upstream LLM response grounding and citations.
-
-    Args:
-        query_vec (np.ndarray / list): The 768-dimensional embedding vector of the query.
-        top_k (int): Maximum number of records to return from the sorted min-heap.
-        document_id (int | None, optional): Primary key of the targeted document 
-            for scoped retrieval. Defaults to None (global cross-document search).
-
-    Returns:
-        list of tuples: A database cursor record list where each row contains stable 
-                        chunk fragments alongside joined parent document metadata fields:
-                        (id, chunk_index, content, metadata, cosine_distance, title, filename).
-    """
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            if document_id is None:
-                cur.execute(
-                    """
-                    SELECT
-                      c.id, c.chunk_index, c.content, c.metadata,
-                      (c.embedding <=> %s) AS cosine_distance,
-                      d.title, d.filename
-                    FROM chunks c
-                    JOIN documents d ON d.id = c.document_id
-                    ORDER BY c.embedding <=> %s
-                    LIMIT %s;
-                    """,
-                    (query_vec, query_vec, top_k),
-                )
-            else:
-                cur.execute(
-                    """
-                    SELECT
-                      c.id, c.chunk_index, c.content, c.metadata,
-                      (c.embedding <=> %s) AS cosine_distance,
-                      d.title, d.filename
-                    FROM chunks c
-                    JOIN documents d ON d.id = c.document_id
-                    WHERE c.document_id = %s
-                    ORDER BY c.embedding <=> %s
-                    LIMIT %s;
-                    """,
-                    (query_vec, document_id, query_vec, top_k),
-                )
-            return cur.fetchall()
-
-
 def extract_cited_chunk_ids(answer: str) -> set[int]:
     """
     Extract cited ids from patterns like: [1], [12], [1,2], [1, 2]
@@ -251,63 +196,6 @@ def extract_cited_chunk_ids(answer: str) -> set[int]:
             if part.isdigit():
                 ids.add(int(part))
     return ids
-
-
-def citations_from_rows(rows: list[tuple]) -> list[Dict[str, Any]]:
-    """
-    Parses an LLM-generated answer text to extract all unique cited chunk IDs.
-
-    This utility functions as a post-processing step in the RAG pipeline. It utilizes 
-    a localized regular expression pattern `r"\[([0-9,\s]+)\]"` to capture standard 
-    academic citation brackets like `[1]`, `[12]`, or multi-citations like `[1, 2]`. 
-    Captured groups are tokenized, stripped of whitespaces, and deduplicated via a 
-    mathematical integer set to prepare clean alignment mappings for frontend UI 
-    hyperlink rendering.
-
-    Args:
-        answer (str): The raw text response string returned by the downstream LLM 
-            containing potential inline bracketed citations.
-
-    Returns:
-        set[int]: A deduplicated set of integers representing the precise database 
-                  `chunk_id`s explicitly referenced in the response text.
-    """
-    out: list[Dict[str, Any]] = []
-    for row in rows:
-        # always take the first 5 (stable)
-        cid, chunk_index, content, metadata, dist = row[:5]
-
-        # optional doc fields from JOIN
-        title = row[5] if len(row) > 5 else None
-        filename = row[6] if len(row) > 6 else None
-
-    # --- 这里是 Step 8.2-5 新增的提取逻辑 ---
-        if isinstance(metadata, dict):
-            page = metadata.get("page")
-            section = metadata.get("section")
-            level = metadata.get("level")
-            # 新增：从 meta 字典里拿 source_type 和 filename
-            source_type = metadata.get("source_type")
-            filename_meta = metadata.get("filename")
-        else:
-            page = section = level = source_type = filename_meta = None
-
-        out.append(
-            {
-                "chunk_id": cid,
-                "chunk_index": chunk_index,
-                "title": title,
-                "filename": filename,
-                "filename_meta": filename_meta,  # 这是从 chunk 冗余字段拿的
-                "source_type": source_type,     # 新增
-                "page": page,
-                "section": section,
-                "level": level,
-                "cosine_distance": float(dist),
-                "snippet": content[:250],
-            }
-        )
-    return out
 
 
 @app.post("/ingest")
@@ -561,6 +449,183 @@ def ask(req: AskRequest) -> Dict[str, Any]:
     return final_response
 
 
+@app.post("/ask_rerank")
+def ask_rerank(req: AskRequest) -> Dict[str, Any]:
+    """
+    RAG endpoint with reranked evidence ordering:
+      1) embed query
+      2) retrieve raw_k candidates (cosine distance)
+      3) refusal decision still based on RAW best cosine distance
+      4) rerank raw rows (order only)
+      5) threshold filter on reranked rows using original cosine distances
+      6) generate grounded answer with citations like [chunk_id]
+      7) return only citations that were actually cited
+    """
+    # --- cache key: make rerank path distinct from /ask ---
+    cache_raw_str = f"rerank|{req.document_id}|{req.query_text}|{req.top_k}"
+    cache_key = sha256(cache_raw_str.encode()).hexdigest()
+
+    now = time.time()
+    if cache_key in _ANSWER_CACHE:
+        ts, cached_response = _ANSWER_CACHE[cache_key]
+        if now - ts < CACHE_TTL_SECONDS:
+            return cached_response
+
+    # 1) query embedding
+    q_vec = embed_queries([req.query_text])[0]
+
+    # 2) raw vector retrieve
+    raw_k = min(req.top_k * 3, 20)
+    rows_raw = retrieve_top_k(q_vec, raw_k, document_id=req.document_id)
+
+    # IMPORTANT:
+    # refusal threshold must still use RAW retrieval distances
+    best_dist = float(rows_raw[0][4]) if rows_raw else None
+
+    if best_dist is None or best_dist > REFUSE_IF_BEST_DISTANCE_GT:
+        return {
+            "ok": True,
+            "query_text": req.query_text,
+            "answer": "I don't know based on the provided documents.",
+            "citations": [],
+            "retrieved_chunks": citations_from_rows(rows_raw),
+            "selected_chunks": [],
+            "threshold": {
+                "filter_max_cosine_distance": FILTER_MAX_COSINE_DISTANCE,
+                "refuse_if_best_distance_gt": REFUSE_IF_BEST_DISTANCE_GT,
+                "best_cosine_distance": best_dist,
+                "raw_k": raw_k,
+                "top_k": req.top_k,
+                "kept_after_filter": 0,
+                "rerank_enabled": True,
+            },
+            "cited_chunk_ids": [],
+            "refused": True,
+            "reason": "Best chunk not similar enough.",
+        }
+
+    # 3) rerank raw rows (changes ORDER only)
+    rows_ranked = rerank_rows(req.query_text, rows_raw)
+
+    # 4) threshold filter, but preserve reranked order
+    rows_filtered = [r for r in rows_ranked if float(
+        r[4]) <= FILTER_MAX_COSINE_DISTANCE]
+    rows_selected = rows_filtered[: req.top_k]
+
+    retrieved_chunks = citations_from_rows(rows_raw)
+    selected_chunks = citations_from_rows(rows_selected)
+
+    # 5) refuse if no sources passed threshold
+    if len(rows_selected) == 0:
+        return {
+            "ok": True,
+            "query_text": req.query_text,
+            "answer": "I don't know based on the provided documents.",
+            "citations": [],
+            "retrieved_chunks": retrieved_chunks,
+            "selected_chunks": [],
+            "threshold": {
+                "filter_max_cosine_distance": FILTER_MAX_COSINE_DISTANCE,
+                "refuse_if_best_distance_gt": REFUSE_IF_BEST_DISTANCE_GT,
+                "best_cosine_distance": best_dist,
+                "raw_k": raw_k,
+                "top_k": req.top_k,
+                "kept_after_filter": len(rows_filtered),
+                "rerank_enabled": True,
+            },
+            "cited_chunk_ids": [],
+            "refused": True,
+            "reason": "No chunks passed similarity threshold.",
+        }
+
+    # 6) prepare sources for LLM using reranked selected rows
+    sources_for_llm: list[Dict[str, Any]] = []
+    for row in rows_selected:
+        cid, chunk_index, content, metadata, dist = row[:5]
+        page = metadata.get("page") if isinstance(metadata, dict) else None
+        sources_for_llm.append(
+            {"chunk_id": cid, "page": page, "content": content}
+        )
+
+    # ---- same intent gate as /ask ----
+    if _needs_conclusion_evidence(req.query_text):
+        joined = "\n".join([s["content"] for s in sources_for_llm])
+        if not _has_any_term(joined, CONCLUSION_TERMS):
+            return {
+                "ok": True,
+                "query_text": req.query_text,
+                "answer": "I don't know based on the provided documents.",
+                "citations": [],
+                "retrieved_chunks": citations_from_rows(rows_raw),
+                "selected_chunks": citations_from_rows(rows_selected),
+                "threshold": {
+                    "filter_max_cosine_distance": FILTER_MAX_COSINE_DISTANCE,
+                    "refuse_if_best_distance_gt": REFUSE_IF_BEST_DISTANCE_GT,
+                    "best_cosine_distance": best_dist,
+                    "raw_k": raw_k,
+                    "top_k": req.top_k,
+                    "kept_after_filter": len(rows_filtered),
+                    "intent_gate": "conclusion_terms_missing",
+                    "rerank_enabled": True,
+                },
+                "cited_chunk_ids": [],
+                "refused": True,
+                "reason": "Conclusion requested but no conclusion-like evidence in retrieved sources.",
+            }
+
+    # 7) generate answer
+    answer = generate_answer(req.query_text, sources_for_llm)
+
+    # 8) keep only actually cited chunks
+    used_ids = extract_cited_chunk_ids(answer)
+    if used_ids:
+        citations_used_only = [
+            c for c in selected_chunks if c["chunk_id"] in used_ids]
+    else:
+        citations_used_only = selected_chunks[:1]
+        if citations_used_only:
+            used_ids = {citations_used_only[0]["chunk_id"]}
+
+    citation_text_lines = []
+    for c in citations_used_only:
+        fn = c.get("filename") or c.get("filename_meta") or "unknown"
+        pg = c.get("page")
+        chunk_id = c.get("chunk_id")
+        snip = c.get("snippet", "").replace("\n", " ").strip()
+        citation_text_lines.append(
+            f"{fn} p.{pg} (chunk {chunk_id}): {snip}"
+            if pg is not None else
+            f"{fn} (chunk {chunk_id}): {snip}"
+        )
+    citation_text = "\n".join(citation_text_lines)
+
+    final_response = {
+        "ok": True,
+        "query_text": req.query_text,
+        "answer": answer,
+        "citations": citations_used_only,
+        "citation_text": citation_text,
+        "cited_chunk_ids": sorted(list(used_ids)),
+        "refused": False,
+        "from_cache": False,
+        "threshold": {
+            "filter_max_cosine_distance": FILTER_MAX_COSINE_DISTANCE,
+            "refuse_if_best_distance_gt": REFUSE_IF_BEST_DISTANCE_GT,
+            "best_cosine_distance": best_dist,
+            "raw_k": raw_k,
+            "top_k": req.top_k,
+            "kept_after_filter": len(rows_filtered),
+            "rerank_enabled": True,
+        }
+    }
+
+    _ANSWER_CACHE[cache_key] = (
+        time.time(), {**final_response, "from_cache": True}
+    )
+
+    return final_response
+
+
 @app.get("/documents")
 def list_documents(
     limit: int = Query(50, ge=1, le=200),
@@ -642,3 +707,18 @@ def retrieve(req: RetrieveRequest):
     rows = retrieve_top_k(q_vec, req.top_k, document_id=req.document_id)
     retrieved = citations_from_rows(rows)
     return {"ok": True, "query_text": req.query_text, "top_k": req.top_k, "results": retrieved}
+
+
+@app.post("/retrieve_rerank")
+def retrieve_rerank(req: RetrieveRequest):
+    q_vec = embed_queries([req.query_text])[0]
+    rows = retrieve_top_k(q_vec, req.top_k, document_id=req.document_id)
+    retrieved = citations_from_rows(rows)
+    reranked = rerank_results(req.query_text, retrieved)
+
+    return {
+        "ok": True,
+        "query_text": req.query_text,
+        "top_k": req.top_k,
+        "results": reranked,
+    }
