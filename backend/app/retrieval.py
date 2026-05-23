@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import re
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict, List
 
 import numpy as np
@@ -50,6 +53,7 @@ def citations_from_rows(rows: list[tuple]) -> list[Dict[str, Any]]:
     but we parse defensively in case columns change later.
     """
     out: list[Dict[str, Any]] = []
+
     for row in rows:
         # stable core fields
         cid, chunk_index, content, metadata, dist = row[:5]
@@ -82,81 +86,169 @@ def citations_from_rows(rows: list[tuple]) -> list[Dict[str, Any]]:
                 "snippet": content[:250],
             }
         )
+
     return out
 
 
 # ---------------------------------------------------------------------
-# Lightweight rerank
+# Lightweight configurable rerank
 # ---------------------------------------------------------------------
 
-BOOST_TERMS: dict[str, float] = {
-    # purpose / objective / goal
-    "purpose": 0.25,
-    "objective": 0.25,
-    "goal": 0.20,
-    "main": 0.08,
-    "directly": 0.06,
-    "exact": 0.06,
+PROFILE_PATH = Path(__file__).with_name("rerank_profiles.json")
 
-    # experiment / study framing
-    "experimental": 0.15,
-    "study": 0.10,
-    "built": 0.05,
-    "around": 0.03,
 
-    # method terms
-    "measured": 0.15,
-    "assay": 0.15,
-    "method": 0.12,
-    "approach": 0.10,
-
-    # limitations / negative evidence / benchmarks
-    "benchmark": 0.15,
-    "accuracy": 0.10,
-    "report": 0.10,
-    "reported": 0.10,
-    "limitation": 0.12,
-    "constraint": 0.10,
-    "current": 0.06,
-    "not": 0.05,
-    "no": 0.05,
-
-    # architecture / metadata
-    "section": 0.08,
-    "metadata": 0.12,
-    "cite": 0.08,
-    "citation": 0.08,
-    # numeric boundary / protocol duration
-    "duration": 0.18,
-    "minute": 0.16,
-    "minutes": 0.16,
-    "protocol": 0.14,
-    "exposed": 0.12,
-    "recover": 0.12,
-    "recovery": 0.10,
-    "phase": 0.08,
-    "peak": 0.10,
-    "value": 0.08,
+FALLBACK_PROFILE: dict[str, Any] = {
+    "boost_terms": {
+        "purpose": 0.25,
+        "objective": 0.25,
+        "goal": 0.20,
+        "method": 0.12,
+        "assay": 0.15,
+        "limitation": 0.12,
+        "metadata": 0.12,
+        "duration": 0.18,
+        "minute": 0.16,
+        "minutes": 0.16,
+        "protocol": 0.14,
+        "exposed": 0.12,
+        "recover": 0.12,
+        "recovery": 0.10,
+        "phase": 0.08,
+        "peak": 0.10,
+        "value": 0.08,
+    },
+    "query_normalizations": {
+        "experimental goal": "objective",
+        "built around": "objective",
+        "main purpose": "purpose",
+        "main objective": "objective",
+        "current constraint": "limitation",
+        "current constraints": "limitations",
+        "what limitation": "limitation",
+        "measurement approach": "method assay",
+        "helpful for evaluation": "easy to retrieve evaluation",
+        "baseline value": "baseline numeric value",
+        "before stress began": "baseline before stress began",
+    },
+    "numeric_boundary": {
+        "duration_query_terms": ["duration", "how long", "minutes", "minute"],
+        "duration_positive_terms": {
+            "minutes": 0.35,
+            "minute": 0.35,
+            "protocol": 0.20,
+            "exposed": 0.15,
+            "recover": 0.12,
+            "recovery": 0.12,
+        },
+        "duration_negative_terms": {
+            "conclusion": -0.12,
+            "result": -0.08,
+            "results": -0.08,
+        },
+        "value_query_terms": ["value", "peak", "mean", "units"],
+        "value_positive_terms": {
+            "value": 0.18,
+            "mean": 0.18,
+            "units": 0.12,
+            "peak": 0.12,
+        },
+    },
 }
 
 
-def normalize_query(text: str) -> str:
+@lru_cache(maxsize=1)
+def load_rerank_profiles() -> dict[str, Any]:
+    """
+    Load rerank profiles from JSON.
+
+    The profile file allows reranking behavior to be tuned without editing
+    Python code. If the file is missing or malformed, fall back to a safe
+    built-in default profile so retrieval endpoints remain usable.
+    """
+    if not PROFILE_PATH.exists():
+        return {"default": FALLBACK_PROFILE}
+
+    try:
+        with PROFILE_PATH.open("r", encoding="utf-8") as f:
+            profiles = json.load(f)
+    except Exception:
+        return {"default": FALLBACK_PROFILE}
+
+    if not isinstance(profiles, dict):
+        return {"default": FALLBACK_PROFILE}
+
+    if "default" not in profiles or not isinstance(profiles["default"], dict):
+        profiles["default"] = FALLBACK_PROFILE
+
+    return profiles
+
+
+def get_rerank_profile(profile_name: str = "default") -> dict[str, Any]:
+    profiles = load_rerank_profiles()
+    profile = profiles.get(profile_name)
+
+    if not isinstance(profile, dict):
+        return profiles["default"]
+
+    return profile
+
+
+def get_weight_map(profile: dict[str, Any], key: str) -> dict[str, float]:
+    raw = profile.get(key, {})
+    if not isinstance(raw, dict):
+        return {}
+
+    out: dict[str, float] = {}
+    for term, weight in raw.items():
+        try:
+            out[str(term).lower()] = float(weight)
+        except (TypeError, ValueError):
+            continue
+
+    return out
+
+
+def get_nested_weight_map(profile: dict[str, Any], section: str, key: str) -> dict[str, float]:
+    raw_section = profile.get(section, {})
+    if not isinstance(raw_section, dict):
+        return {}
+
+    raw = raw_section.get(key, {})
+    if not isinstance(raw, dict):
+        return {}
+
+    out: dict[str, float] = {}
+    for term, weight in raw.items():
+        try:
+            out[str(term).lower()] = float(weight)
+        except (TypeError, ValueError):
+            continue
+
+    return out
+
+
+def get_nested_terms(profile: dict[str, Any], section: str, key: str) -> list[str]:
+    raw_section = profile.get(section, {})
+    if not isinstance(raw_section, dict):
+        return []
+
+    raw = raw_section.get(key, [])
+    if not isinstance(raw, list):
+        return []
+
+    return [str(x).lower() for x in raw]
+
+
+def normalize_query(text: str, profile_name: str = "default") -> str:
     t = text.lower()
+    profile = get_rerank_profile(profile_name)
 
-    # abstract intent normalization
-    t = t.replace("experimental goal", "objective")
-    t = t.replace("built around", "objective")
-    t = t.replace("main purpose", "purpose")
-    t = t.replace("main objective", "objective")
+    replacements = profile.get("query_normalizations", {})
+    if not isinstance(replacements, dict):
+        replacements = {}
 
-    # weaker paraphrase normalization
-    t = t.replace("current constraint", "limitation")
-    t = t.replace("current constraints", "limitations")
-    t = t.replace("what limitation", "limitation")
-    t = t.replace("measurement approach", "method assay")
-    t = t.replace("helpful for evaluation", "easy to retrieve evaluation")
-    t = t.replace("baseline value", "baseline numeric value")
-    t = t.replace("before stress began", "baseline before stress began")
+    for src, dst in replacements.items():
+        t = t.replace(str(src).lower(), str(dst).lower())
 
     return t
 
@@ -165,59 +257,100 @@ def tokenize(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", text.lower())
 
 
-def numeric_boundary_bonus(query: str, text: str) -> float:
-    q = normalize_query(query)
-    q_tokens = set(tokenize(q))
-    t_tokens = set(tokenize(text))
+def term_matches_query(term: str, q_norm: str, q_tokens: set[str]) -> bool:
+    """
+    Support both single-token terms and phrase terms such as 'how long'.
+    """
+    term = term.lower().strip()
+    if not term:
+        return False
 
+    if " " in term:
+        return term in q_norm
+
+    return term in q_tokens
+
+
+def term_matches_text(term: str, text_norm: str, t_tokens: set[str]) -> bool:
+    """
+    Support both single-token terms and phrase terms in retrieved text.
+    """
+    term = term.lower().strip()
+    if not term:
+        return False
+
+    if " " in term:
+        return term in text_norm
+
+    return term in t_tokens
+
+
+def query_has_any_term(terms: list[str], q_norm: str, q_tokens: set[str]) -> bool:
+    return any(term_matches_query(term, q_norm, q_tokens) for term in terms)
+
+
+def apply_weight_map_to_text(
+    weights: dict[str, float],
+    text_norm: str,
+    t_tokens: set[str],
+) -> float:
     bonus = 0.0
 
-    asks_duration = (
-        "duration" in q_tokens
-        or ("how" in q_tokens and "long" in q_tokens)
-        or "minutes" in q_tokens
-        or "minute" in q_tokens
-    )
-
-    if asks_duration:
-        # Strongly reward chunks that actually contain timing/protocol evidence.
-        if "minutes" in t_tokens or "minute" in t_tokens:
-            bonus += 0.35
-        if "protocol" in t_tokens:
-            bonus += 0.20
-        if "exposed" in t_tokens:
-            bonus += 0.15
-        if "recover" in t_tokens or "recovery" in t_tokens:
-            bonus += 0.12
-
-        # Penalize pure conclusion/result chunks for duration questions.
-        if "conclusion" in t_tokens:
-            bonus -= 0.12
-        if "result" in t_tokens or "results" in t_tokens:
-            bonus -= 0.08
-
-    asks_numeric_value = (
-        "value" in q_tokens
-        or "peak" in q_tokens
-        or "mean" in q_tokens
-        or "units" in q_tokens
-    )
-
-    if asks_numeric_value:
-        if "value" in t_tokens or "mean" in t_tokens:
-            bonus += 0.18
-        if "units" in t_tokens:
-            bonus += 0.12
-        if "peak" in t_tokens:
-            bonus += 0.12
+    for term, weight in weights.items():
+        if term_matches_text(term, text_norm, t_tokens):
+            bonus += weight
 
     return bonus
 
 
-def lexical_bonus(query: str, text: str) -> float:
-    q_norm = normalize_query(query)
+def numeric_boundary_bonus(query: str, text: str, profile_name: str = "default") -> float:
+    profile = get_rerank_profile(profile_name)
+
+    q_norm = normalize_query(query, profile_name=profile_name)
+    text_norm = text.lower()
+
     q_tokens = set(tokenize(q_norm))
-    t_tokens = set(tokenize(text))
+    t_tokens = set(tokenize(text_norm))
+
+    duration_query_terms = get_nested_terms(
+        profile, "numeric_boundary", "duration_query_terms"
+    )
+    duration_positive_terms = get_nested_weight_map(
+        profile, "numeric_boundary", "duration_positive_terms"
+    )
+    duration_negative_terms = get_nested_weight_map(
+        profile, "numeric_boundary", "duration_negative_terms"
+    )
+
+    value_query_terms = get_nested_terms(
+        profile, "numeric_boundary", "value_query_terms"
+    )
+    value_positive_terms = get_nested_weight_map(
+        profile, "numeric_boundary", "value_positive_terms"
+    )
+
+    bonus = 0.0
+
+    asks_duration = query_has_any_term(duration_query_terms, q_norm, q_tokens)
+    if asks_duration:
+        bonus += apply_weight_map_to_text(duration_positive_terms, text_norm, t_tokens)
+        bonus += apply_weight_map_to_text(duration_negative_terms, text_norm, t_tokens)
+
+    asks_numeric_value = query_has_any_term(value_query_terms, q_norm, q_tokens)
+    if asks_numeric_value:
+        bonus += apply_weight_map_to_text(value_positive_terms, text_norm, t_tokens)
+
+    return bonus
+
+
+def lexical_bonus(query: str, text: str, profile_name: str = "default") -> float:
+    profile = get_rerank_profile(profile_name)
+
+    q_norm = normalize_query(query, profile_name=profile_name)
+    text_norm = text.lower()
+
+    q_tokens = set(tokenize(q_norm))
+    t_tokens = set(tokenize(text_norm))
 
     bonus = 0.0
 
@@ -225,16 +358,19 @@ def lexical_bonus(query: str, text: str) -> float:
     overlap = q_tokens & t_tokens
     bonus += 0.03 * len(overlap)
 
-    # stronger term-weight bonus
-    for tok, weight in BOOST_TERMS.items():
+    # configurable term-weight bonus
+    boost_terms = get_weight_map(profile, "boost_terms")
+    for tok, weight in boost_terms.items():
         if tok in q_tokens and tok in t_tokens:
             bonus += weight
 
-    bonus += numeric_boundary_bonus(query, text)
+    # configurable numeric-boundary bonus
+    bonus += numeric_boundary_bonus(query, text, profile_name=profile_name)
+
     return bonus
 
 
-def rerank_score(query: str, result: dict[str, Any]) -> float:
+def rerank_score(query: str, result: dict[str, Any], profile_name: str = "default") -> float:
     """
     Higher is better.
 
@@ -242,21 +378,30 @@ def rerank_score(query: str, result: dict[str, Any]) -> float:
     """
     dist = float(result.get("cosine_distance", 999.0))
     snippet = str(result.get("snippet", ""))
-    return (-dist) + lexical_bonus(query, snippet)
+    return (-dist) + lexical_bonus(query, snippet, profile_name=profile_name)
 
 
-def rerank_results(query: str, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def rerank_results(
+    query: str,
+    results: list[dict[str, Any]],
+    profile_name: str = "default",
+) -> list[dict[str, Any]]:
     reranked: list[dict[str, Any]] = []
+
     for r in results:
         x = dict(r)
-        x["rerank_score"] = rerank_score(query, r)
+        x["rerank_score"] = rerank_score(query, r, profile_name=profile_name)
         reranked.append(x)
 
     reranked.sort(key=lambda x: x["rerank_score"], reverse=True)
     return reranked
 
 
-def rerank_rows(query: str, rows: list[tuple]) -> list[tuple]:
+def rerank_rows(
+    query: str,
+    rows: list[tuple],
+    profile_name: str = "default",
+) -> list[tuple]:
     """
     Rerank raw DB rows by:
       1) converting rows -> citation-style dicts
@@ -272,7 +417,7 @@ def rerank_rows(query: str, rows: list[tuple]) -> list[tuple]:
         return rows
 
     retrieved = citations_from_rows(rows)
-    reranked = rerank_results(query, retrieved)
+    reranked = rerank_results(query, retrieved, profile_name=profile_name)
 
     row_by_chunk_id = {row[0]: row for row in rows}  # row[0] = chunk_id
     out: list[tuple] = []

@@ -1,0 +1,105 @@
+{
+  "default": {
+    "boost_terms": {
+      "purpose": 0.25,
+      "objective": 0.25,
+      "goal": 0.20,
+      "main": 0.08,
+      "directly": 0.06,
+      "exact": 0.06,
+
+      "experimental": 0.15,
+      "study": 0.10,
+      "built": 0.05,
+      "around": 0.03,
+
+      "workflow": 0.12,
+      "stages": 0.10,
+      "ingest": 0.08,
+      "chunks": 0.08,
+      "retrieve": 0.08,
+      "evidence": 0.08,
+
+      "measured": 0.15,
+      "assay": 0.15,
+      "method": 0.12,
+      "approach": 0.10,
+
+      "benchmark": 0.15,
+      "accuracy": 0.10,
+      "report": 0.10,
+      "reported": 0.10,
+      "limitation": 0.12,
+      "constraint": 0.10,
+      "current": 0.06,
+      "not": 0.05,
+      "no": 0.05,
+
+      "section": 0.08,
+      "metadata": 0.12,
+      "cite": 0.08,
+      "citation": 0.08,
+
+      "duration": 0.18,
+      "minute": 0.16,
+      "minutes": 0.16,
+      "protocol": 0.14,
+      "exposed": 0.12,
+      "recover": 0.12,
+      "recovery": 0.10,
+      "phase": 0.08,
+      "peak": 0.10,
+      "value": 0.08
+    },
+
+    "query_normalizations": {
+      "experimental goal": "objective",
+      "built around": "objective",
+      "main purpose": "purpose",
+      "main objective": "objective",
+
+      "current constraint": "limitation",
+      "current constraints": "limitations",
+      "what limitation": "limitation",
+      "measurement approach": "method assay",
+      "helpful for evaluation": "easy to retrieve evaluation",
+      "baseline value": "baseline numeric value",
+      "before stress began": "baseline before stress began"
+    },
+
+    "numeric_boundary": {
+      "duration_query_terms": [
+        "duration",
+        "how long",
+        "minutes",
+        "minute"
+      ],
+      "duration_positive_terms": {
+        "minutes": 0.35,
+        "minute": 0.35,
+        "protocol": 0.20,
+        "exposed": 0.15,
+        "recover": 0.12,
+        "recovery": 0.12
+      },
+      "duration_negative_terms": {
+        "conclusion": -0.12,
+        "result": -0.08,
+        "results": -0.08
+      },
+
+      "value_query_terms": [
+        "value",
+        "peak",
+        "mean",
+        "units"
+      ],
+      "value_positive_terms": {
+        "value": 0.18,
+        "mean": 0.18,
+        "units": 0.12,
+        "peak": 0.12
+      }
+    }
+  }
+}
